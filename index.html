@@ -1569,13 +1569,93 @@ function netWS(cb){
     };
   });
 }
+/* transport C : pair à pair (WebRTC via PeerJS) : le créateur du monde est l'hôte, aucun serveur à toi nécessaire */
+function loadScript(urls,done){
+  if(window.Peer){done(true);return}
+  if(!urls.length){done(false);return}
+  var sc=document.createElement('script');sc.src=urls[0];
+  sc.onload=function(){done(!!window.Peer)};sc.onerror=function(){loadScript(urls.slice(1),done)};
+  document.head.appendChild(sc);
+}
+function netPeer(cb){
+  return new Promise(function(res){
+    loadScript(['https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js','https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js','https://cdnjs.cloudflare.com/ajax/libs/peerjs/1.5.4/peerjs.min.js'],function(ok){
+      if(!ok){res(null);return}
+      var pid='cubera-'+mpCode.toLowerCase(),clean=function(n){return String(n||'Joueur').replace(/[^\p{L}\p{N} _-]/gu,'').slice(0,16)||'Joueur'};
+      var num=function(v,lo,hi){return typeof v==='number'&&isFinite(v)?Math.max(lo,Math.min(hi,v)):0};
+      var done=false,peer;
+      function finish(api){if(!done){done=true;res(api)}}
+      if(mpNew){
+        /* HÔTE */
+        var edits=new Map(),clients={},plist={},nid=1,VOLM=W*D*H,hp=null,tries=0;
+        try{var sv=JSON.parse(localStorage.getItem('cubera_p2p_'+mpCode)||'[]');for(var q=0;q<sv.length;q+=2){edits.set(sv[q],sv[q+1])}}catch(e){}
+        var svT=null;function saveEd(){if(svT)return;svT=setTimeout(function(){svT=null;try{var a=[];edits.forEach(function(v,k){a.push(k,v)});localStorage.setItem('cubera_p2p_'+mpCode,JSON.stringify(a))}catch(e){}},1500)}
+        edits.forEach(function(v,k){cb.edit(k,v)});
+        function list(skip){return Object.keys(plist).filter(function(k){return k!==skip}).map(function(k){return plist[k]})}
+        function bc(o,skip){Object.keys(clients).forEach(function(k){if(k!==skip){try{clients[k].send(o)}catch(e){}}})}
+        function mkHost(){
+        peer=new Peer(pid);
+        peer.on('open',function(){finish({
+          sendPos:function(o){var p={t:'peer',id:'host',name:clean(o.name),x:o.x,y:o.y,z:o.z,yaw:o.yaw};hp=p;bc(p)},
+          sendEdit:function(i,id){edits.set(i,id);saveEd();bc({t:'edit',i:i,id:id})}
+        })});
+        peer.on('error',function(e){if(e&&e.type==='unavailable-id'){if(++tries<4){try{peer.destroy()}catch(x){}setTimeout(function(){mkHost()},3000)}else cb.fatal('Ce code est déjà utilisé : crée un autre monde.')}else cb.status('Réseau : '+(e&&e.type||'erreur'))});
+        peer.on('connection',function(conn){
+          var id='c'+(nid++);
+          conn.on('open',function(){
+            if(Object.keys(clients).length>=11){try{conn.send({t:'err',msg:'Ce monde est plein (12 joueurs).'})}catch(e){}setTimeout(function(){conn.close()},300);return}
+            clients[id]=conn;var flat=[];edits.forEach(function(v,k){flat.push(k,v)});
+            conn.send({t:'init',id:id,edits:flat,peers:list(id).concat(hp?[hp]:[])});
+            cb.peers(list());
+          });
+          conn.on('data',function(m){
+            if(!m||typeof m!=='object')return;
+            if(m.t==='pos'){var p={t:'peer',id:id,name:clean(m.name),x:num(m.x,-10,300),y:num(m.y,-10,100),z:num(m.z,-10,300),yaw:num(m.yaw,-20,20)};plist[id]=p;bc(p,id);cb.peers(list())}
+            else if(m.t==='edit'){var i=m.i|0,v=m.id|0;if(i<0||i>=VOLM||v<0||v>255)return;edits.set(i,v);saveEd();bc({t:'edit',i:i,id:v},id);cb.edit(i,v)}
+          });
+          conn.on('close',function(){delete clients[id];delete plist[id];bc({t:'left',id:id});cb.peers(list())});
+        });
+        }
+        mkHost();
+        setTimeout(function(){if(!done)finish(null)},25000);
+      }else{
+        /* INVITÉ */
+        var peers={},conn;
+        peer=new Peer();
+        peer.on('error',function(e){
+          if(e&&e.type==='peer-unavailable'){cb.fatal('Monde introuvable : vérifie le code, et que l’hôte est bien dans le jeu.')}
+          else if(!done){finish(null)}else cb.status('Réseau : '+(e&&e.type||'erreur'))
+        });
+        peer.on('open',function(){
+          conn=peer.connect(pid,{reliable:true,serialization:'json'});
+          conn.on('open',function(){finish({
+            sendPos:function(o){try{conn.send({t:'pos',name:o.name,x:o.x,y:o.y,z:o.z,yaw:o.yaw})}catch(e){}},
+            sendEdit:function(i,id){try{conn.send({t:'edit',i:i,id:id})}catch(e){}}
+          })});
+          conn.on('data',function(m){
+            if(!m||typeof m!=='object')return;
+            function pl(){return Object.keys(peers).map(function(k){return peers[k]})}
+            if(m.t==='init'){for(var q=0;q<m.edits.length;q+=2)cb.edit(m.edits[q],m.edits[q+1]);peers={};(m.peers||[]).forEach(function(p){peers[p.id]=p});cb.peers(pl())}
+            else if(m.t==='peer'){peers[m.id]=m;cb.peers(pl())}
+            else if(m.t==='left'){delete peers[m.id];cb.peers(pl())}
+            else if(m.t==='edit')cb.edit(m.i,m.id);
+            else if(m.t==='err')cb.fatal(m.msg||'Erreur');
+          });
+          conn.on('close',function(){cb.status('L’hôte a quitté le monde.')});
+        });
+        setTimeout(function(){if(!done)finish(null)},15000);
+      }
+    });
+  });
+}
 function mpInit(){
   if(!mpOn)return;
   mpBar=document.createElement('div');mpBar.id='mpbar';mpBar.textContent='Connexion…';mpBar.title='Clique pour copier le code';document.body.appendChild(mpBar);
   var cb={peers:mpSetPeers,edit:mpApply,status:mpWarn,fatal:function(m){toast(m);try{localStorage.removeItem('cubera_mp');localStorage.removeItem('cubera_mpnew')}catch(e){}setTimeout(function(){location.reload()},2500)}};
   var useClaude=!!(window.claude&&window.claude.use);
-  (useClaude?netClaude(cb):netWS(cb)).then(function(n){
-    if(!n){mpBar.textContent=useClaude?'Multijoueur indisponible : connecte-toi à claude.ai.':'Serveur multijoueur introuvable.';return}
+  var noWS=/github\.io$|\.pages\.dev$|\.netlify\.app$/.test(location.hostname)&&!/\bws=1\b/.test(location.search);
+  (useClaude?netClaude(cb):(noWS?Promise.resolve(null):netWS(cb)).then(function(n){return n||netPeer(cb)})).then(function(n){
+    if(!n){mpBar.textContent=useClaude?'Multijoueur indisponible : connecte-toi à claude.ai.':'Connexion impossible (vérifie ta connexion Internet).';return}
     net=n;
   }).catch(function(){mpBar.textContent='Multijoueur indisponible.'});
 }
